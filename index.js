@@ -21,14 +21,16 @@ program.command('describe')
     .argument('<file>', 'path to firmware acrive (*.iboot)')
     .action(async (file, options) => {
         let archive = await readFirmwareArchive(file);
-        for (let product of Object.values(archive.products)) {
-            if (product.blob)
-                product.blobLength = product.blob.length;
-        }
         console.dir(archive);
     });
 
 program.parse();
+
+function sha256(blob) {
+    let hash = crypto.createHash('sha256');
+    hash.update(blob);
+    return hash.digest('hex');
+}
 
 function createFirmwareStream(file) {
     const key = 'gbUst8Ce8Cp4bkPw';
@@ -99,9 +101,14 @@ async function readFirmwareArchive(file) {
                 case 1: // EOF record
                     if (dataLength !== 0 || offset !== 0)
                         throw new Error('EOF record malformed');
+                    blob = blob.subarray(0, maxAddress);
+
                     if (archive.products[productId].blob !== undefined)
                         throw new Error('Encountered a second blob for the same product');
-                    archive.products[productId].blob = blob.subarray(0, maxAddress);
+                    let product = archive.products[productId];
+                    product.blob = blob;
+                    product.blobLength = blob.length;
+                    product.blobHash = sha256(blob);
                     blob = undefined;
                     break;
                 case 2: // extended segment address
