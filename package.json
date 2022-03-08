@@ -24,6 +24,7 @@
   },
   "homepage": "https://github.com/j9brown/node-zwave-pe653#readme",
   "dependencies": {
-    "commander": "^9.0.0"
+    "commander": "^9.0.0",
+    "mqtt": "^4.3.6"
   }
 }
