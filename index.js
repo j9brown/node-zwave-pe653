@@ -229,35 +229,40 @@ class LogTransport {
         this._inner = inner;
     }
 
-    async send(packet) {
+    async sendAndReceive(packet) {
         console.log(`>> SEND ${packet}`);
-        return await this._inner.send(packet);
-    }
-
-    async receive() {
-        const packet = await this._inner.receive();
-        console.log(`<< RECV ${packet}`);
-        return packet;
+        const reply = await this._inner.sendAndReceive(packet);
+        console.log(`<< RECV ${reply}`);
+        return reply;
     }
 }
 
 class FakeTransport {
     constructor(debug) {
-        this._pendingReply = null;
         this._nextSeq = 0;
         this._state = 'wait';
         this._debug = debug;
         this._blob = new Uint8Array(knownFirmwareSize);
     }
 
-    async send(packet) {
-        if (packet.length < 2 || packet[0] !== commandFirmwareTransfer) return;
+    sendAndReceive(packet) {
+        // Throttle the responses to simulate communication delay (vaguely).
+        const reply = this._handlePacket(packet);
+        return new Promise((resolve, reject) => {
+            setTimeout(() => {
+                resolve(reply);
+            }, 5);
+        });
+    }
+
+    _handlePacket(packet) {
+        if (packet.length < 2 || packet[0] !== commandFirmwareTransfer) return null;
 
         const type = packet[1];
         const seq = packet.length >= 4 ? packet[2] | (packet[3] << 8) : -1;
         switch (type) {
             case packetStart: {
-                if (this._state !== 'wait') return;
+                if (this._state !== 'wait') return null;
 
                 if (this._debug)
                     console.log('!! START');
@@ -266,7 +271,7 @@ class FakeTransport {
                 break;
             }
             case packetData: {
-                if (this._state !== 'transfer' || this._nextSeq !== seq || packet.length < 6) return;
+                if (this._state !== 'transfer' || this._nextSeq !== seq || packet.length < 6) return null;
 
                 const data = packet.slice(4, packet.length - 2);
                 const crc = packet[packet.length - 2] | (packet[packet.length - 1] << 8);
@@ -290,38 +295,28 @@ class FakeTransport {
                 break;
             }
             case packetDone: {
-                if (this._state !== 'transfer' || this._nextSeq !== seq || packet.length < 4) return;
+                if (this._state !== 'transfer' || this._nextSeq !== seq || packet.length < 4) return null;
 
                 if (this._debug)
                     console.log(`!! DONE ${seq}`);
 
-                this._state = checkFirmwareCRC(blob) ? 'done' : 'error';
+                this._state = checkFirmwareCRC(this._blob) ? 'done' : 'error';
                 break;
             }
         }
+
         switch (this._state) {
             case 'transfer':
-                this._pendingReply = [commandFirmwareTransfer, packetDataRequest,
+                return [commandFirmwareTransfer, packetDataRequest,
                         this._nextSeq & 255, this._nextSeq >> 8];
-                break;
             case 'error':
-                this._pendingReply = [commandFirmwareTransfer, packetCRCError,
+                return [commandFirmwareTransfer, packetCRCError,
                         this._nextSeq & 255, this._nextSeq >> 8];
-                break;
             case 'done':
-                this._pendingReply = [commandFirmwareTransfer, packetDone,
+                return [commandFirmwareTransfer, packetDone,
                         this._nextSeq & 255, this._nextSeq >> 8];
-                break;
         }
-    }
-
-    receive() {
-        return new Promise((resolve, reject) => {
-            setTimeout(() => {
-                resolve(this._pendingReply);
-                this._pendingReply = null;
-            }, 5);
-        });
+        return null;
     }
 }
 
@@ -375,12 +370,8 @@ class ZwaveJS2MqttTransport {
         `);
     }
 
-    async send(packet) {
-        // call driver.sendCommand?
-    }
-
-    async receive() {
-        // call driver.waitForCommand?
+    async sendAndReceive(packet) {
+        // call driver.sendCommand or driver.waitForCommand?
         return null;
     }
 
@@ -434,14 +425,12 @@ async function uploadFirmware(blob, transport) {
     }
 
     console.log('Starting firmware upload...');
-    await transport.send(currentPacket);
     for (;;) {
-        const reply = await transport.receive();
+        const reply = await transport.sendAndReceive(currentPacket);
         if (reply === null) {
             timeouts++;
             if (timeouts < maxTimeouts) {
                 console.log(`Timeout occurred, resending last packet (${timeouts}/${maxTimeouts})`);
-                transport.send(currentPacket);
                 continue;
             }
             console.log(`Upload failed due to timeout, giving up`);
@@ -454,7 +443,7 @@ async function uploadFirmware(blob, transport) {
         const type = reply[1];
         const seq = reply[2] | (reply[3] << 8);
         switch (type) {
-            case packetDataRequest:
+            case packetDataRequest: {
                 if (seq !== currentSeq + 1) continue;
                 currentSeq = seq;
                 const offset = seq * 32;
@@ -466,18 +455,19 @@ async function uploadFirmware(blob, transport) {
                     let crc16 = 0;
                     currentPacket.forEach((byte) => { crc16 = crc16update(crc16, byte) });
                     currentPacket.push(crc16 & 0xff, crc16 >> 8);
-                    await transport.send(currentPacket);
                 } else {
                     currentPacket = [commandFirmwareTransfer, packetDone, seq & 0xff, seq >> 8];
-                    await transport.send(currentPacket);
                 }
                 break;
-            case packetDone:
+            }
+            case packetDone: {
                 console.log('Successfully uploaded firmware');
                 return true;
-            case packetCRCError:
+            }
+            case packetCRCError: {
                 console.log('Upload failed due to CRC error');
                 return false;
+            }
         }
     }
 }
