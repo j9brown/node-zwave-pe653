@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const readline = require('readline');
 const { once } = require('events');
 const mqtt = require('mqtt');
+const { crc16update, crc32firmware } = require('./crc');
 
 // The Intermatic manufacturer ID for ZWave products.
 const manufacturerId = 0x0005;
@@ -16,6 +17,31 @@ function getFirmwareLabel(nodeInfo) {
         if (nodeInfo.productId === 0x0953) return "PE0953";
     }
     return null;
+}
+
+function actualFirmwareCRC(blob) {
+    return crc32firmware(blob.slice(0, blob.length - 4));
+}
+
+function expectedFirmwareCRC(blob) {
+    return (blob[blob.length - 1] |
+            (blob[blob.length - 2] << 8) |
+            (blob[blob.length - 3] << 16) |
+            (blob[blob.length - 4] << 24)) >>> 0;
+}
+
+function checkFirmwareCRC(blob) {
+    // This check doesn't work for some reason.  We're missing some details
+    // about how the uploaded firmware is laid out in memory and checked.
+    // The firmware blob is 116 KB whereas the flash is presumed to be 128 KB
+    // so perhaps some sections of the flash aren't overwritten.
+    if (false) {
+        const actualCRC = actualFirmwareCRC(blob);
+        const expectedCRC = expectedFirmwareCRC(blob);
+        console.log(`!! CRC check, expected 0x${expectedCRC.toString(16)}, actual 0x${actualCRC.toString(16)}`)
+        return actualCRC === expectedCRC;
+    }
+    return true;
 }
 
 function sha256(blob) {
@@ -176,18 +202,7 @@ const packetDone = 6;
 const packetCRCError = 7;
 const commandFirmwareTransfer = 42;
 const maxTimeouts = 5;
-
-// XMODEM CRC16 algorithm
-// Courtesy of: https://mdfs.net/Info/Comp/Comms/CRC16.htm
-function updateCRC16(crc16, byte) {
-    crc16 ^= byte << 8;
-    for (let i = 0; i < 8; i++) {
-        crc16 <<= 1;
-        if (crc16 & 0x10000)
-            crc16 = (crc16 ^ 0x1021) & 0xffff;
-    }
-    return crc16;
-}
+const knownFirmwareSize = 116 * 1024;
 
 class LogTransport {
     constructor(inner) {
@@ -212,6 +227,7 @@ class FakeTransport {
         this._nextSeq = 0;
         this._state = 'wait';
         this._debug = debug;
+        this._blob = new Uint8Array(knownFirmwareSize);
     }
 
     async send(packet) {
@@ -236,15 +252,21 @@ class FakeTransport {
                 const crc = packet[packet.length - 2] | (packet[packet.length - 1] << 8);
                 let check = 0;
                 for (let i = 0; i < packet.length - 2; i++)
-                    check = updateCRC16(check, packet[i]);
+                    check = crc16update(check, packet[i]);
                 if (this._debug)
-                    console.log(`!! DATA ${seq} ${data} ${crc} (${check})`);
+                    console.log(`!! DATA ${seq} ${data} 0x${crc.toString(16)} (0x${check.toString(16)})`);
+                if (check !== crc) return; // presumably the receiver ignores the packet to await a retransmit
 
-                if (check !== crc) {
+                const offset = seq * 32;
+                if (offset + data.length > this._blob.length) {
+                    if (this._debug)
+                        console.log(`!! Received blob too large`);
                     this._state = 'error';
-                } else {
-                    this._nextSeq++;
+                    break;
                 }
+
+                this._blob.set(data, seq * 32);
+                this._nextSeq++;
                 break;
             }
             case packetDone: {
@@ -252,7 +274,8 @@ class FakeTransport {
 
                 if (this._debug)
                     console.log(`!! DONE ${seq}`);
-                this._state = 'done';
+
+                this._state = checkFirmwareCRC(blob) ? 'done' : 'error';
                 break;
             }
         }
@@ -380,6 +403,16 @@ async function uploadFirmware(blob, transport) {
     let currentPacket = [commandFirmwareTransfer, packetStart];
     let timeouts = 0;
 
+    if (blob.length !== knownFirmwareSize) {
+        console.error(`Incorrect firmware size, expected ${knownFirmwareSize}, got ${blob.length}`);
+        return false;
+    }
+
+    if (!checkFirmwareCRC(blob)) {
+        console.error(`Incorrect firmware CRC`);
+        return false;
+    }
+
     console.log('Starting firmware upload...');
     await transport.send(currentPacket);
     for (;;) {
@@ -411,7 +444,7 @@ async function uploadFirmware(blob, transport) {
                     const data = blob.slice(offset, Math.min(offset + 32, blob.length));
                     currentPacket = [commandFirmwareTransfer, packetData, seq & 0xff, seq >> 8].concat(data);
                     let crc16 = 0;
-                    currentPacket.forEach((byte) => { crc16 = updateCRC16(crc16, byte) });
+                    currentPacket.forEach((byte) => { crc16 = crc16update(crc16, byte) });
                     currentPacket.push(crc16 & 0xff, crc16 >> 8);
                     await transport.send(currentPacket);
                 } else {
