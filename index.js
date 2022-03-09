@@ -10,7 +10,7 @@ const { crc16update, crc32firmware } = require('./crc');
 const manufacturerId = 0x0005;
 const productType = 0x5045; // 'PE'
 
-function getFirmwareLabel(nodeInfo) {
+function getProductId(nodeInfo) {
     if (nodeInfo.manufacturerId === manufacturerId &&
             nodeInfo.productType === productType) {
         if (nodeInfo.productId === 0x0653) return "PE0653";
@@ -320,7 +320,7 @@ class FakeTransport {
     }
 }
 
-class ZwaveJS2MqttTransport {
+class ZwaveJS2MqttServer {
     constructor(url, api, debug) {
         this._url = url;
         this._callTopic = api + '/driverFunction/set';
@@ -357,7 +357,7 @@ class ZwaveJS2MqttTransport {
         return this._driverFunction(`
             const nodeId = ${nodeId};
             const node = driver.controller.nodes.get(nodeId);
-            if (node === undefined) return null;
+            if (!node) return null;
             return {
                 nodeId: node.id,
                 name: node.name,
@@ -370,9 +370,20 @@ class ZwaveJS2MqttTransport {
         `);
     }
 
-    async sendAndReceive(packet) {
-        // call driver.sendCommand or driver.waitForCommand?
-        return null;
+    async sendAndReceive(nodeId, packet) {
+        // FIXME: Can't obtain a response from the message using the current API.
+        return this._driverFunction(`
+            const nodeId = ${nodeId};
+            const packet = ${JSON.stringify(packet)};
+            const node = driver.controller.nodes.get(nodeId);
+            if (!node) return null;
+            const endpoint = node.getEndpoint(0);
+            if (!endpoint) return null;
+            const api = endpoint.commandClasses[0x91];
+            await api.sendData(${manufacturerId}, Buffer.from(packet));
+            const reply = [];
+            return reply;
+        `);
     }
 
     async _driverFunction(code) {
@@ -406,6 +417,18 @@ class ZwaveJS2MqttTransport {
                 if (err) reject(err); else resolve(result);
             });
         });
+    }
+}
+
+class ZwaveJS2MqttTransport {
+    constructor(server, nodeId) {
+        this._server = server;
+        this._nodeId = nodeId;
+    }
+
+    sendAndReceive(packet) {
+        // call driver.sendCommand or driver.waitForCommand?
+        return this._server.sendAndReceive(this._nodeId, packet);
     }
 }
 
@@ -470,6 +493,12 @@ async function uploadFirmware(blob, transport) {
             }
         }
     }
+}
+
+async function getTime(transport) {
+    const reply = await transport.sendAndReceive([0x40, 0x01, 0x01, 0x83, 0x01, 0x01]);
+    if (!reply || reply.length < 16 || reply[0] != 0x40) return null;
+    return `${reply[14]}:${reply[15]}`
 }
 
 program
@@ -539,10 +568,10 @@ program.command('upload')
             console.dir(archive);
         }
 
-        let transport = new ZwaveJS2MqttTransport(mqtt, api, options.d);
-        await transport.connect();
+        let server = new ZwaveJS2MqttServer(mqtt, api, options.d);
+        await server.connect();
 
-        const nodeInfo = await transport.getNodeInfo(nodeId);
+        const nodeInfo = await server.getNodeInfo(nodeId);
         if (nodeInfo === null) {
             console.error(`Could not get information about node ${nodeId}`);
             process.exit(1);
@@ -560,22 +589,22 @@ program.command('upload')
         console.log(`- current firmware version: ${nodeInfo.firmwareVersion}`);
         console.log('');
 
-        const firmwareLabel = getFirmwareLabel(nodeInfo);
-        if (firmwareLabel === null) {
+        const productId = getProductId(nodeInfo);
+        if (productId === null) {
             console.error(`This program does not support upgrading the firmware of this node`);
             process.exit(1);
         }
 
-        const product = archive.products[firmwareLabel];
+        const product = archive.products[productId];
         if (product === undefined) {
-            console.error(`The provided firmware archive does not contain a blob for product ${firmwareLabel}`);
+            console.error(`The provided firmware archive does not contain a blob for product ${productId}`);
             process.exit(1);
         }
 
         console.log(`Upgrade to perform:`);
         console.log(`- new firmware version: ${product.version}`);
         console.log(`- new firmware hash: ${product.blobHash})`);
-        console.log(`- product id: ${firmwareLabel}`);
+        console.log(`- product id: ${productId}`);
         console.log(`- product name: ${product.name}`);
         console.log(`- product notice: ${product.message}`);
         console.log('');
@@ -590,9 +619,47 @@ program.command('upload')
             process.exit(1);
         }
 
+        let transport = new ZwaveJS2MqttTransport(server, nodeId);
         if (options.d) transport = new LogTransport(transport);
         const result = await uploadFirmware(archive.products['PE0653'].blob, transport);
         if (!result) process.exit(1);
+    });
+
+program.command('get-time')
+    .description('Queries the current time from a PE653 as way to test communication with the node')
+    .argument('<nodeId>', 'Zwave node id to update')
+    .argument('<mqtt>', 'zwavejs2mqtt server\'s MQTT broker URL, e.g. mqtt://user:password@host/')
+    .argument('<api>', 'zwavejs2mqtt server\'s API topic, e.g. zwavejs/_CLIENTS/ZWAVE_GATEWAY-HomeAssistant/api')
+    .option('-d', 'debug output')
+    .action(async (nodeId, mqtt, api, options) => {
+        let server = new ZwaveJS2MqttServer(mqtt, api, options.d);
+        await server.connect();
+
+        const nodeInfo = await server.getNodeInfo(nodeId);
+        if (nodeInfo === null) {
+            console.error(`Could not get information about node ${nodeId}`);
+            process.exit(1);
+        }
+        if (options.d) {
+            console.log('Node information:');
+            console.dir(nodeInfo);
+        }
+
+        const productId = getProductId(nodeInfo);
+        if (productId !== "PE0653") {
+            console.error(`This node is not a PE653`);
+            process.exit(1);
+        }
+
+        let transport = new ZwaveJS2MqttTransport(server, nodeId);
+        if (options.d) transport = new LogTransport(transport);
+        const time = await getTime(transport);
+        if (time) {
+            console.log(`The current time according to the PE653 controller is: ${time}`);
+        } else {
+            console.error('Unable to communicate with the PE653 controller');
+            process.exit(1);
+        }
     });
 
 program.parse();
