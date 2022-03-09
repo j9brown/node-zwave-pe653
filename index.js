@@ -56,7 +56,7 @@ function createFirmwareStream(file) {
     return fs.createReadStream(file).pipe(decipher);
 }
 
-async function readFirmwareArchive(file) {
+async function readFirmwareArchive(file, createIhexStream, createBinStream) {
     const maxBlobLength = 128 * 1024;
     const reader = readline.createInterface({
             input: createFirmwareStream(file),
@@ -70,6 +70,7 @@ async function readFirmwareArchive(file) {
     let blob = undefined;
     let extendedSegmentAddress = 0;
     let maxAddress = 0;
+    let hexStream = undefined;
     reader.on('line', (line) => {
         if (line.startsWith(':')) {
             if (line.length % 2 !== 1)
@@ -92,6 +93,12 @@ async function readFirmwareArchive(file) {
                 blob = new Uint8Array(maxBlobLength).fill(0xff);
                 extendedSegmentAddress = 0;
                 maxAddress = 0;
+                if (createIhexStream)
+                    hexStream = createIhexStream(productId);
+            }
+            if (hexStream) {
+                hexStream.write(line);
+                hexStream.write('\n');
             }
     
             // [0]       length of record data
@@ -119,10 +126,23 @@ async function readFirmwareArchive(file) {
                 case 1: // EOF record
                     if (dataLength !== 0 || offset !== 0)
                         throw new Error('EOF record malformed');
-                    blob = blob.subarray(0, maxAddress);
-
                     if (archive.products[productId].blob !== undefined)
                         throw new Error('Encountered a second blob for the same product');
+
+                    if (hexStream) {
+                        hexStream.close();
+                        hexStream = undefined;
+                    }
+    
+                    blob = blob.subarray(0, maxAddress);
+                    if (createBinStream) {
+                        const stream = createBinStream(productId);
+                        if (stream) {
+                            stream.write(blob);
+                            stream.close();
+                        }
+                    }
+
                     let product = archive.products[productId];
                     product.blob = blob;
                     product.blobLength = blob.length;
@@ -477,8 +497,21 @@ program.command('decrypt')
 program.command('describe')
     .description('Describes the contents of a firmware archive')
     .argument('<file>', 'path to firmware archive (*.iboot)')
+    .option('--write-ihex', 'writes the blobs in ihex format next to the original file')
+    .option('--write-bin', 'writes the blobs in binary format next to the original file')
     .action(async (file, options) => {
-        const archive = await readFirmwareArchive(file);
+        const baseName = file.replace(/.iboot$/, '');
+        const archive = await readFirmwareArchive(file,
+            options.writeIhex ? function(name) {
+                const output = baseName.concat('-', name, '.ihex');
+                console.log(`Creating ${output}`);
+                return fs.createWriteStream(output);
+            } : null,
+            options.writeBin ? function(name) {
+                const output = baseName.concat('-', name, '.bin');
+                console.log(`Creating ${output}`);
+                return fs.createWriteStream(output);
+            } : null);
 
         console.log('Firmware images:');
         console.dir(archive);
