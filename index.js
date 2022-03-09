@@ -539,8 +539,8 @@ program.command('upload')
     .description('Uploads firmware to a device')
     .argument('<file>', 'path to firmware archive (*.iboot)')
     .argument('<nodeId>', 'Zwave node id to update')
-    .argument('<mqtt>', 'ZwaveJS2MQTT server\'s MQTT broker URL, e.g. mqtt://user:password@host/')
-    .argument('<api>', 'ZwaveJS2MQTT server\'s API topic, e.g. zwavejs/_CLIENTS/ZWAVE_GATEWAY-HomeAssistant/api')
+    .argument('<mqtt>', 'zwavejs2mqtt server\'s MQTT broker URL, e.g. mqtt://user:password@host/')
+    .argument('<api>', 'zwavejs2mqtt server\'s API topic, e.g. zwavejs/_CLIENTS/ZWAVE_GATEWAY-HomeAssistant/api')
     .option('-d', 'debug output')
     .action(async (file, nodeId, mqtt, api, options) => {
         const archive = await readFirmwareArchive(file);
