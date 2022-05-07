@@ -20,7 +20,7 @@ function getProductId(nodeInfo) {
 }
 
 function actualFirmwareCRC(blob) {
-    return crc32firmware(blob.slice(0, blob.length - 4));
+    return crc32firmware(blob.subarray(0, blob.length - 4));
 }
 
 function expectedFirmwareCRC(blob) {
@@ -247,7 +247,7 @@ class FakeTransport {
 
     sendAndReceive(packet) {
         // Throttle the responses to simulate communication delay (vaguely).
-        const reply = this._handlePacket(packet);
+        const reply = this._handlePacket(Uint8Array.from(packet));
         return new Promise((resolve, reject) => {
             setTimeout(() => {
                 resolve(reply);
@@ -273,13 +273,13 @@ class FakeTransport {
             case packetData: {
                 if (this._state !== 'transfer' || this._nextSeq !== seq || packet.length < 6) return null;
 
-                const data = packet.slice(4, packet.length - 2);
+                const data = packet.subarray(4, packet.length - 2);
                 const crc = packet[packet.length - 2] | (packet[packet.length - 1] << 8);
                 let check = 0;
                 for (let i = 0; i < packet.length - 2; i++)
                     check = crc16update(check, packet[i]);
                 if (this._debug)
-                    console.log(`!! DATA ${seq} ${data} 0x${crc.toString(16)} (0x${check.toString(16)})`);
+                    console.log(`!! DATA(${packet.length}) seq ${seq} - ${data} - crc 0x${crc.toString(16)} (0x${check.toString(16)})`);
                 if (check !== crc) return; // presumably the receiver ignores the packet to await a retransmit
 
                 const offset = seq * 32;
@@ -323,9 +323,12 @@ class FakeTransport {
 class ZwaveJS2MqttServer {
     constructor(url, api, debug) {
         this._url = url;
-        this._callTopic = api + '/driverFunction/set';
-        this._resultTopic = api + '/driverFunction';
-        this._resolveResult = null;
+        this._sendCommandCallTopic = api + '/sendCommand/set';
+        this._sendCommandResultTopic = api + '/sendCommand';
+        this._sendCommandResolve = null;
+        this._driverFunctionCallTopic = api + '/driverFunction/set';
+        this._driverFunctionResultTopic = api + '/driverFunction';
+        this._driverFunctionResolve = null;
         this._debug = debug;
     }
 
@@ -341,16 +344,25 @@ class ZwaveJS2MqttServer {
         });
 
         this._client.on('message', (topic, message) => {
-            if (topic === this._resultTopic && this._resolveResult) {
-                this._resolveResult(JSON.parse(message.toString()));
-                this._resolveResult = null;
+            if (topic === this._sendCommandResultTopic && this._sendCommandResolve) {
+                this._sendCommandResolve(JSON.parse(message.toString()));
+                this._sendCommandResolve = null;
+            }
+            if (topic === this._driverFunctionResultTopic && this._driverFunctionResolve) {
+                this._driverFunctionResolve(JSON.parse(message.toString()));
+                this._driverFunctionResolve = null;
             }
         });
 
         await once(this._client, 'connect');
 
-        await this._subscribe(this._resultTopic);
+        await this._subscribe(this._sendCommandResultTopic);
+        await this._subscribe(this._driverFunctionResultTopic);
         console.log('Connected to Zwave2MQTT server via MQTT');
+    }
+
+    async disconnect() {
+        await this._client.end();
     }
 
     getNodeInfo(nodeId) {
@@ -371,27 +383,45 @@ class ZwaveJS2MqttServer {
     }
 
     async sendAndReceive(nodeId, packet) {
-        // FIXME: Can't obtain a response from the message using the current API.
-        return this._driverFunction(`
-            const nodeId = ${nodeId};
-            const packet = ${JSON.stringify(packet)};
-            const node = driver.controller.nodes.get(nodeId);
-            if (!node) return null;
-            const endpoint = node.getEndpoint(0);
-            if (!endpoint) return null;
-            const api = endpoint.commandClasses[0x91];
-            await api.sendData(${manufacturerId}, Buffer.from(packet));
-            const reply = [];
-            return reply;
-        `);
+        const result = await this._sendCommand(nodeId, 0, 0x91, "sendAndReceiveData", [
+            manufacturerId,
+            { type: "Buffer", data: Array.from(packet) }
+        ]);
+        if (result) {
+            return Array.from(result.data.data);
+        }
+    }
+
+    async _sendCommand(nodeId, endpoint, commandClass, method, args) {
+        const call = JSON.stringify({ args: [
+            { "nodeId": nodeId, "endpoint": endpoint, "commandClass": commandClass },
+            method,
+            args
+        ]});
+        await this._publish(this._sendCommandCallTopic, call);
+
+        const response = await new Promise((resolve, reject) => {
+            this._sendCommandResolve = resolve;
+        });
+        if (this._debug)
+            console.dir(response);
+
+        if (response.args[0].nodeId !== nodeId ||
+            response.args[0].endpoint !== endpoint ||
+            response.args[0].commandClass !== commandClass ||
+            response.args[1] !== method)
+            throw Error(`Send command call response mismatch`);
+        if (!response.success)
+            throw Error(`Send command call failed: ${response.message}`);
+        return response.result;
     }
 
     async _driverFunction(code) {
         const call = JSON.stringify({ args: [ code ]});
-        await this._publish(this._callTopic, call);
+        await this._publish(this._driverFunctionCallTopic, call);
 
         const response = await new Promise((resolve, reject) => {
-            this._resolveResult = resolve;
+            this._driverFunctionResolve = resolve;
         });
         if (this._debug)
             console.dir(response);
@@ -450,7 +480,7 @@ async function uploadFirmware(blob, transport) {
     console.log('Starting firmware upload...');
     for (;;) {
         const reply = await transport.sendAndReceive(currentPacket);
-        if (reply === null) {
+        if (!reply) {
             timeouts++;
             if (timeouts < maxTimeouts) {
                 console.log(`Timeout occurred, resending last packet (${timeouts}/${maxTimeouts})`);
@@ -473,7 +503,7 @@ async function uploadFirmware(blob, transport) {
                 if (offset % 1024 === 0)
                     console.log(`Sending data (${offset}/${blob.length})`);
                 if (offset < blob.length) {
-                    const data = blob.slice(offset, Math.min(offset + 32, blob.length));
+                    const data = Array.from(blob.subarray(offset, Math.min(offset + 32, blob.length)));
                     currentPacket = [commandFirmwareTransfer, packetData, seq & 0xff, seq >> 8].concat(data);
                     let crc16 = 0;
                     currentPacket.forEach((byte) => { crc16 = crc16update(crc16, byte) });
@@ -499,6 +529,14 @@ async function getTime(transport) {
     const reply = await transport.sendAndReceive([0x40, 0x01, 0x01, 0x83, 0x01, 0x01]);
     if (!reply || reply.length < 16 || reply[0] != 0x40) return null;
     return `${reply[14]}:${reply[15]}`
+}
+
+function parseIntArgument(value, dummyPrevious) {
+    const parsedValue = parseInt(value, 10);
+    if (isNaN(parsedValue)) {
+      throw new commander.InvalidArgumentError('Not a number.');
+    }
+    return parsedValue;
 }
 
 program
@@ -557,7 +595,7 @@ program.command('fake-upload')
 program.command('upload')
     .description('Uploads firmware to a device')
     .argument('<file>', 'path to firmware archive (*.iboot)')
-    .argument('<nodeId>', 'Zwave node id to update')
+    .argument('<nodeId>', 'Zwave node id to update', parseIntArgument)
     .argument('<mqtt>', 'zwavejs2mqtt server\'s MQTT broker URL, e.g. mqtt://user:password@host/')
     .argument('<api>', 'zwavejs2mqtt server\'s API topic, e.g. zwavejs/_CLIENTS/ZWAVE_GATEWAY-HomeAssistant/api')
     .option('-d', 'debug output')
@@ -623,11 +661,13 @@ program.command('upload')
         if (options.d) transport = new LogTransport(transport);
         const result = await uploadFirmware(archive.products['PE0653'].blob, transport);
         if (!result) process.exit(1);
+
+        await server.disconnect();
     });
 
 program.command('get-time')
     .description('Queries the current time from a PE653 as way to test communication with the node')
-    .argument('<nodeId>', 'Zwave node id to update')
+    .argument('<nodeId>', 'Zwave node id to update', parseIntArgument)
     .argument('<mqtt>', 'zwavejs2mqtt server\'s MQTT broker URL, e.g. mqtt://user:password@host/')
     .argument('<api>', 'zwavejs2mqtt server\'s API topic, e.g. zwavejs/_CLIENTS/ZWAVE_GATEWAY-HomeAssistant/api')
     .option('-d', 'debug output')
@@ -653,6 +693,7 @@ program.command('get-time')
 
         let transport = new ZwaveJS2MqttTransport(server, nodeId);
         if (options.d) transport = new LogTransport(transport);
+
         const time = await getTime(transport);
         if (time) {
             console.log(`The current time according to the PE653 controller is: ${time}`);
@@ -660,6 +701,8 @@ program.command('get-time')
             console.error('Unable to communicate with the PE653 controller');
             process.exit(1);
         }
+
+        await server.disconnect();
     });
 
 program.parse();
