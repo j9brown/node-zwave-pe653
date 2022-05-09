@@ -61,3 +61,81 @@ for the PE953 remote control.
 ### Get more information and see additional functions
 
 `$ npm start -- --help`
+
+## Technical Information
+
+The PE653 and PE953 contain a STM32F101RC microcontroller with 256 KB of flash and
+32 KB of RAM along with a ZW0301 Zwave transceiver.
+
+The devices use a simple protocol to receive firmware updates over the air as a sequence
+of 32 byte packets. The firmware is 116 KB so it takes 3712 packets to transmit the data
+plus a few more to start and end the transfer. It may require several minutes to complete.
+
+The firmware updater operates in two phases. First it verifies the checksum of each packet
+as it is received and stores it into a reserved area of the flash memory. Once all of the
+data has been received, it overwrites the original firmware with the new one and reboots.
+
+This process should be somewhat resilient to incomplete transfers and certain forms of
+data corruption. If the transfer fails partway, simply wait for the device to timeout and
+reset itself then try again.
+
+However, it's still possible to brick the devices. Fortunately they contain a programming
+header that you can use to recover.
+
+### Firmware Recovery
+
+You'll need an ST-Link v2 interface (original or a clone) and the STM32CubeProgrammer
+software (or compatible debugging tools for the STM32 microcontoller).
+
+The programming header is an [ARM Standard JTAG](https://www.keil.com/support/man/docs/ulinkpro/ulinkpro_hw_if_jtag20.htm)
+interface with 20 pins. We'll use 4 pins to access the microcontroller's Serial Wire Debug
+(SWD) function.
+
+Hook up these 4 pins up to your ST-Link interface as indicated:
+
+  * Pin 7: SWDIO
+  * Pin 9: SWCLK
+  * Pin 15: RST
+  * Pin 20: GND
+
+(Do not hook up VCC as you may damage the device or your computer!)
+
+Plug the ST-Link into your computer then power on the device and connect to it using the
+STM32CubeProgrammer software. You may need to press a button on the handheld remote to wake
+up the microcontroller.
+
+First, make a backup of the existing firmware on the device!
+
+  * Read the entire 256 KB of flash starting at address 0x08000000, size 0x40000.
+  * Save it to a file somewhere safe.
+
+Next, use the `describe` command to extract the firmware as a binary blob.
+
+  * `$ npm start -- describe PE953_RELEASE_34.iboot --write-bin`
+
+Finally, program the firmware into device.
+
+  * Locate the correct firmware for the device.
+    * Receiver: PE953_RELEASE_34-PE0653.bin
+    * Handheld unit: PE953_RELEASE_34-PE0953.bin
+  * Set the start address to 0x08002000.
+    * WARNING: The firmware is not located at the start of flash memory. Don't accidentally
+      overwrite the bootloader at 0x08000000! Double-check that the start address is set to
+      0x08002000 before proceeding.
+  * Flash the firmware.
+  * Unplug the ST-Link interface from your computer and disconnect it from the device's
+    programming header.
+
+With luck, this worked and your device is running the new firmware. If not, you have a
+backup of the flash so you can try again. Make sure you used the correct firmware binary
+and start address.
+
+### Flash Memory Map
+
+Here's what I've been able to infer about the memory map of the device's flash memory:
+
+  * 0x08000000 - 0x0803FFFF: Flash memory, size: 0x40000 (256 KB)
+  * 0x08000000 - 0x08001FFF: Bootloader, size: 0x2000 (8 KB)
+  * 0x08002000 - 0x0801EFFF: Firmware, size: 0x1D000 (116 KB)
+  * 0x0801F000 - 0x0803BFFF: Uploaded temporary copy of firmware, size: 0x1D000 (116 KB)
+  * 0x0803C000 - 0x0803FFFF: Non-volatile data?, size: 0x4000 (16 KB)
