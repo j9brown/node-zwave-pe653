@@ -31,10 +31,7 @@ function expectedFirmwareCRC(blob) {
 }
 
 function checkFirmwareCRC(blob) {
-    // This check doesn't work for some reason.  We're missing some details
-    // about how the uploaded firmware is laid out in memory and checked.
-    // The firmware blob is 116 KB whereas the flash is presumed to be 128 KB
-    // so perhaps some sections of the flash aren't overwritten.
+    // This check doesn't work.  We're probably using the wrong algorithm.
     if (false) {
         const actualCRC = actualFirmwareCRC(blob);
         const expectedCRC = expectedFirmwareCRC(blob);
@@ -207,6 +204,9 @@ async function readFirmwareArchive(file, createIhexStream, createBinStream) {
 //
 // on received packet [CMD, DONE, seq]:
 //    transfer succeeded
+//    NOTE: It seems that these devices don't actually send a DONE packet at the end of
+//          the transfer or it gets lost in transit although the firmware updater expects
+//          to receive one.
 //
 // on received packet [CMD, CRC_ERROR, seq]:
 //    transfer failed
@@ -313,8 +313,10 @@ class FakeTransport {
                 return [commandFirmwareTransfer, packetCRCError,
                         this._nextSeq & 255, this._nextSeq >> 8];
             case 'done':
-                return [commandFirmwareTransfer, packetDone,
-                        this._nextSeq & 255, this._nextSeq >> 8];
+                // In practice, this packet seems to get lost in transit, so let's simulate that behavior.
+                // It's ok either way.
+                //return [commandFirmwareTransfer, packetDone,
+                //        this._nextSeq & 255, this._nextSeq >> 8];
         }
         return null;
     }
@@ -466,6 +468,7 @@ async function uploadFirmware(blob, transport) {
     let currentSeq = -1;
     let currentPacket = [commandFirmwareTransfer, packetStart];
     let timeouts = 0;
+    let done = false;
 
     if (blob.length !== knownFirmwareSize) {
         console.error(`Incorrect firmware size, expected ${knownFirmwareSize}, got ${blob.length}`);
@@ -486,7 +489,12 @@ async function uploadFirmware(blob, transport) {
                 console.log(`Timeout occurred, resending last packet (${timeouts}/${maxTimeouts})`);
                 continue;
             }
-            console.log(`Upload failed due to timeout, giving up`);
+            if (done) {
+                console.log('All packets were sent but we did not receive final confirmation from the device!\n' +
+                    'Assuming the firmware was successfully uploaded');
+            } else {
+                console.log('Upload failed due to timeout, giving up');
+            }
             return false;
         }
         timeouts = 0;
@@ -509,6 +517,7 @@ async function uploadFirmware(blob, transport) {
                     currentPacket.forEach((byte) => { crc16 = crc16update(crc16, byte) });
                     currentPacket.push(crc16 & 0xff, crc16 >> 8);
                 } else {
+                    done = true;
                     currentPacket = [commandFirmwareTransfer, packetDone, seq & 0xff, seq >> 8];
                 }
                 break;
@@ -621,7 +630,7 @@ program.command('upload')
 
         console.log('');
         console.log(`Node to upgrade:`);
-        console.log(`- nodeId: ${nodeInfo.id}`);
+        console.log(`- nodeId: ${nodeInfo.nodeId}`);
         console.log(`- name: ${nodeInfo.name}`);
         console.log(`- location: ${nodeInfo.location}`);
         console.log(`- current firmware version: ${nodeInfo.firmwareVersion}`);
@@ -641,7 +650,7 @@ program.command('upload')
 
         console.log(`Upgrade to perform:`);
         console.log(`- new firmware version: ${product.version}`);
-        console.log(`- new firmware hash: ${product.blobHash})`);
+        console.log(`- new firmware hash: ${product.blobHash}`);
         console.log(`- product id: ${productId}`);
         console.log(`- product name: ${product.name}`);
         console.log(`- product notice: ${product.message}`);
@@ -659,7 +668,7 @@ program.command('upload')
 
         let transport = new ZwaveJS2MqttTransport(server, nodeId);
         if (options.d) transport = new LogTransport(transport);
-        const result = await uploadFirmware(archive.products['PE0653'].blob, transport);
+        const result = await uploadFirmware(product.blob, transport);
         if (!result) process.exit(1);
 
         await server.disconnect();
